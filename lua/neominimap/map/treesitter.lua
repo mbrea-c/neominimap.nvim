@@ -123,9 +123,9 @@ local get_buffer_highlights_co = function(bufnr)
 end
 
 ---@class (exact) Neominimap.MinimapHighlight
----@field line integer
----@field col integer
----@field end_col integer
+---@field line integer 0-based minimap row
+---@field start_cell integer 1-based first minimap cell (codepoint) of the run
+---@field end_cell integer 1-based last minimap cell (inclusive)
 ---@field group string
 
 ---Extracts the highlighting from the given buffer using treesitter.
@@ -234,8 +234,8 @@ M.extract_highlights_co = function(bufnr)
                 end
                 ret[#ret + 1] = {
                     line = y - 1,
-                    col = (x - 1) * 3,
-                    end_col = end_x * 3,
+                    start_cell = x,
+                    end_cell = end_x,
                     group = group,
                 }
             end
@@ -247,17 +247,37 @@ end
 
 --- Applies the given highlights to the given buffer.
 --- If there are multiple highlights for the same position, all of them will be applied.
+---
+--- Cell indices are converted to byte columns against the rendered minimap
+--- line itself: minimap glyphs have no fixed byte width (the octant set mixes
+--- 1-byte spaces, 3-byte block elements and 4-byte Symbols for Legacy
+--- Computing), so a cell's byte offset depends on every glyph before it.
 ---@async
 ---@param mbufnr integer
 ---@param highlights Neominimap.MinimapHighlight[]
 M.apply_co = function(mbufnr, highlights)
     api.nvim_buf_clear_namespace(mbufnr, namespace, 0, -1)
+    local lines = api.nvim_buf_get_lines(mbufnr, 0, -1, false)
+    ---@type table<integer, integer[]> row -> byte start of each codepoint
+    local pos_cache = {}
     local co = require("neominimap.cooperative")
     co.for_in_co(ipairs(highlights))(5000, function(_, hl)
-        api.nvim_buf_set_extmark(mbufnr, namespace, hl.line, hl.col, {
-            end_col = hl.end_col,
-            hl_group = hl.group,
-        })
+        local line = lines[hl.line + 1]
+        if line then
+            local pos = pos_cache[hl.line]
+            if not pos then
+                pos = vim.str_utf_pos(line)
+                pos_cache[hl.line] = pos
+            end
+            local col = pos[hl.start_cell] and pos[hl.start_cell] - 1 or #line
+            local end_col = pos[hl.end_cell + 1] and pos[hl.end_cell + 1] - 1 or #line
+            if col < end_col then
+                api.nvim_buf_set_extmark(mbufnr, namespace, hl.line, col, {
+                    end_col = end_col,
+                    hl_group = hl.group,
+                })
+            end
+        end
     end)
 end
 
