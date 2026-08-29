@@ -6,28 +6,6 @@ local treesitter = vim.treesitter
 
 local namespace = api.nvim_create_namespace("neominimap_treesitter")
 
----The most common elements in the given table
----@generic T
----@param tbl table<T,integer>
----@return table<T, boolean>
-local function most_commons(tbl)
-    local max = 0
-    for _, count in pairs(tbl) do
-        if count > max then
-            max = count
-        end
-    end
-
-    local result = {}
-    for entry, count in pairs(tbl) do
-        if count == max then
-            result[entry] = true
-        end
-    end
-
-    return result
-end
-
 ---@param group string
 local function resolve_hl_link(group)
     local hl = vim.api.nvim_get_hl(0, { name = group })
@@ -38,24 +16,57 @@ local function resolve_hl_link(group)
     return hl
 end
 
----@type table<string, string>
-local hl_cache = {}
-
-function M.clear_hl_cache()
-    hl_cache = {}
+---The effective foreground a capture group paints, or nil for a transparent
+---one. Mirrors the highlighter's dotted-name fallback: "@a.b.c" falls back to
+---"@a.b", then "@a", until a DEFINED group is found; that group's (possibly
+---absent) fg is the answer, links followed. A capture that lands on no fg —
+---@spell, helper captures, fg-less groups — paints nothing rather than
+---erasing what sits below it.
+---@param group string
+---@return integer|nil fg
+local function resolve_capture_fg(group)
+    while group ~= "" do
+        local hl = resolve_hl_link(group)
+        if next(hl) ~= nil then
+            return hl.fg
+        end
+        group = group:match("^(.*)%.[^.]*$") or ""
+    end
+    return nil
 end
 
----@param hl_group string
----@return string
-local get_or_create_hl_info = function(hl_group)
-    if hl_cache[hl_group] then
-        return hl_cache[hl_group]
+---@type table<string, integer|false> capture name -> fg (false = transparent)
+local fg_cache = {}
+---@type table<integer, string> fg -> minimap highlight group
+local group_cache = {}
+
+function M.clear_hl_cache()
+    fg_cache = {}
+    group_cache = {}
+end
+
+---@param capture string a capture name, without the leading "@"
+---@return integer|nil fg
+local capture_fg = function(capture)
+    local cached = fg_cache[capture]
+    if cached ~= nil then
+        return cached or nil
     end
-    local hl_info = resolve_hl_link(hl_group)
-    local new_group = "_Neominimap." .. hl_group
-    api.nvim_set_hl(0, new_group, { fg = hl_info.fg and string.format("#%06x", hl_info.fg) })
-    hl_cache[hl_group] = new_group
-    return new_group
+    local fg = resolve_capture_fg("@" .. capture)
+    fg_cache[capture] = fg or false
+    return fg
+end
+
+---@param fg integer
+---@return string
+local get_or_create_group = function(fg)
+    local group = group_cache[fg]
+    if not group then
+        group = string.format("_Neominimap_%06x", fg)
+        api.nvim_set_hl(0, group, { fg = string.format("#%06x", fg) })
+        group_cache[fg] = group
+    end
+    return group
 end
 
 ---@class (exact) Neominimap.BufferHighlight
@@ -129,8 +140,12 @@ end
 ---@field group string
 
 ---Extracts the highlighting from the given buffer using treesitter.
----For any codepoint, the most common group will be chosen.
----If there are multiple groups with the same number of occurrences, all will be chosen.
+---
+---Captures resolve to effective COLORS first — applied in order, later
+---captures painting over earlier ones, fg-less captures transparent — the
+---same layering the editor itself renders. Each minimap cell then takes the
+---most common effective color among the codepoints it covers; ties break on
+---the lower color value, so the same buffer always renders the same.
 ---@async
 ---@param bufnr integer
 ---@return Neominimap.MinimapHighlight[]
@@ -149,58 +164,53 @@ M.extract_highlights_co = function(bufnr)
         return text.codepoints_pos(str, tabwidth)
     end, lines)
 
-    ---@type fun(row:integer, char_idx:integer):integer?
-    local char_idx_to_codepoint_idx = function(row, char_idx)
+    ---@type fun(row:integer, byte_idx:integer):integer? byte_idx is 1-based
+    local byte_to_codepoint_idx = function(row, byte_idx)
         if code_point_list[row] == nil then
             return nil
         end
-        local utf8_idx = text.byte_index_to_utf8_index(char_idx, utf8_pos_list[row])
-        local code_point_idx = code_point_list[row][utf8_idx]
-        return code_point_idx
+        local utf8_idx = text.byte_index_to_utf8_index(byte_idx, utf8_pos_list[row])
+        return code_point_list[row][utf8_idx]
     end
 
     local co = require("neominimap.cooperative")
 
-    local highlights = {}
-    co.for_co(1, minimap_height, 1, 10000, function(row)
-        local line = {}
-        for col = 1, minimap_width do
-            line[col] = { level = 0, groups = {} }
-        end
-        highlights[row] = line
+    -- Paint pass: the effective color of every codepoint.
+    -- get_buffer_highlights_co yields captures in application order (a tree's
+    -- own captures in query order, injections after their host), so painting
+    -- is a plain overwrite; transparency is the skip.
+    ---@type table<integer, table<integer, integer>> row -> codepoint -> fg
+    local colors = {}
+    co.for_co(1, line_count, 1, 10000, function(row)
+        colors[row] = {}
     end)
     co.defer_co()
     if not api.nvim_buf_is_valid(bufnr) then
         return {}
     end
 
-    local fold = require("neominimap.map.fold")
-    local coord = require("neominimap.map.coord")
-    local folds = fold.get_cached_folds(bufnr)
     co.for_in_co(ipairs(get_buffer_highlights_co(bufnr)))(2000, function(_, h) ---@cast h Neominimap.BufferHighlight
-        local minimap_hl = get_or_create_hl_info("@" .. h.group)
-
-        for row = h.start_row, h.end_row do
-            local vrow, hide = fold.subtract_fold_lines(folds, row)
-            if not hide then
-                local from = row == h.start_row and h.start_col or 1
-                local to = row == h.end_row and h.end_col or string.len(lines[row])
-                local from_codepint = char_idx_to_codepoint_idx(row, from)
-                local to_codepint = char_idx_to_codepoint_idx(row, to)
-                if from_codepint ~= nil and to_codepint ~= nil then
-                    for col = from_codepint, to_codepint do
-                        local mrow, mcol = coord.codepoint_to_mcodepoint(vrow, col)
-                        if mcol > minimap_width then
-                            break
-                        end
-                        local ceil = highlights[mrow][mcol]
-                        if ceil.level < h.level then
-                            ceil.level = h.level
-                            ceil.groups = {}
-                        end
-                        if ceil.level == h.level then
-                            ceil.groups[minimap_hl] = (ceil.groups[minimap_hl] or 0) + 1
-                        end
+        local fg = capture_fg(h.group)
+        if fg then
+            -- Treesitter ranges are 0-based with an exclusive end column, so
+            -- +1 makes start 1-based while the raw end column IS the 1-based
+            -- inclusive last byte; an end column of 0 means the capture
+            -- stopped at the previous row's boundary.
+            local last_row = h.end_row
+            local last_col = h.end_col
+            if last_col == 0 then
+                last_row = last_row - 1
+                last_col = math.huge
+            end
+            for row = h.start_row, math.min(last_row, line_count) do
+                local from = row == h.start_row and h.start_col + 1 or 1
+                local to = row == last_row and math.min(last_col, #lines[row]) or #lines[row]
+                local from_cp = byte_to_codepoint_idx(row, from)
+                local to_cp = byte_to_codepoint_idx(row, to)
+                if from_cp ~= nil and to_cp ~= nil then
+                    local line_colors = colors[row]
+                    for col = from_cp, to_cp do
+                        line_colors[col] = fg
                     end
                 end
             end
@@ -211,9 +221,34 @@ M.extract_highlights_co = function(bufnr)
         return {}
     end
 
-    co.for_co(1, minimap_height, 1, 5000, function(y)
-        for x = 1, minimap_width do
-            highlights[y][x] = most_commons(highlights[y][x].groups)
+    -- Downscale: vote per cell over the painted codepoints' colors.
+    local fold = require("neominimap.map.fold")
+    local coord = require("neominimap.map.coord")
+    local folds = fold.get_cached_folds(bufnr)
+    ---@type table<integer, table<integer, table<integer, integer>>> mrow -> mcol -> fg -> count
+    local cells = {}
+    co.for_co(1, minimap_height, 1, 10000, function(mrow)
+        local line = {}
+        for mcol = 1, minimap_width do
+            line[mcol] = {}
+        end
+        cells[mrow] = line
+    end)
+    co.defer_co()
+    if not api.nvim_buf_is_valid(bufnr) then
+        return {}
+    end
+
+    co.for_co(1, line_count, 1, 1000, function(row)
+        local vrow, hide = fold.subtract_fold_lines(folds, row)
+        if not hide then
+            for col, fg in pairs(colors[row]) do
+                local mrow, mcol = coord.codepoint_to_mcodepoint(vrow, col)
+                if cells[mrow] and mcol <= minimap_width then
+                    local counts = cells[mrow][mcol]
+                    counts[fg] = (counts[fg] or 0) + 1
+                end
+            end
         end
     end)
     co.defer_co()
@@ -223,21 +258,36 @@ M.extract_highlights_co = function(bufnr)
 
     ---@type Neominimap.MinimapHighlight[]
     local ret = {}
-    co.for_co(1, minimap_height, 1, 5000, function(y)
-        for x = 1, minimap_width do
-            for group in pairs(highlights[y][x]) do
-                -- For performance reasons, consecutive highlights are merged into one.
+    co.for_co(1, minimap_height, 1, 5000, function(mrow)
+        ---@type table<integer, integer>
+        local winner = {}
+        for mcol = 1, minimap_width do
+            local best, best_count
+            for fg, count in pairs(cells[mrow][mcol]) do
+                if best == nil or count > best_count or (count == best_count and fg < best) then
+                    best, best_count = fg, count
+                end
+            end
+            winner[mcol] = best
+        end
+        -- Consecutive cells that agree merge into one extmark.
+        local x = 1
+        while x <= minimap_width do
+            local fg = winner[x]
+            if fg == nil then
+                x = x + 1
+            else
                 local end_x = x
-                while end_x < minimap_width and vim.tbl_contains(highlights[y][end_x + 1], group) do
-                    highlights[y][end_x + 1][group] = nil
+                while end_x < minimap_width and winner[end_x + 1] == fg do
                     end_x = end_x + 1
                 end
                 ret[#ret + 1] = {
-                    line = y - 1,
+                    line = mrow - 1,
                     start_cell = x,
                     end_cell = end_x,
-                    group = group,
+                    group = get_or_create_group(fg),
                 }
+                x = end_x + 1
             end
         end
     end)
