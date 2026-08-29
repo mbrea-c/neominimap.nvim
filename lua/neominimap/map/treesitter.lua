@@ -78,7 +78,7 @@ local get_buffer_highlights_co = function(bufnr)
     ---@param level integer
     local function traverse(parser, level)
         local trees = (function()
-            if vim.fn.has("0.11") then
+            if vim.fn.has("0.11") == 1 then
                 return co_api.parse_language_tree_co(parser)
             else
                 parser:parse()
